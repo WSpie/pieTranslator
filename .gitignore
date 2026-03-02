@@ -1,0 +1,4 @@
+archives/*
+*.ipynb
+translation_msg.csv
+tamu_ai.json
