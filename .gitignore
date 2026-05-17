@@ -4,3 +4,5 @@ data/translation_msg.csv
 config.yaml
 __pycache__/
 .claude/
+*.pyc
+data/
