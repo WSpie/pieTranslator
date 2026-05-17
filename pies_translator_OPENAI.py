@@ -8,14 +8,15 @@ import json
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple
-from collections import defaultdict
+from typing import Dict, Optional, List, Tuple, Set, Callable
+from collections import defaultdict, deque
 
+import yaml
 import discord
 from discord import Intents, app_commands
 from dotenv import load_dotenv
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
@@ -28,20 +29,29 @@ try:
 except Exception:
     pass
 
-# ========== ENV ==========
+# ========== Config ==========
+# Secrets live in config.yaml (gitignored). Non-secret runtime knobs stay in .env.
 load_dotenv()
 
-DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN", "").strip()
-DEBUG_MODE      = os.getenv("PIES_DEBUG", "0").strip() == "1"
-FLAG_EPHEMERAL_SECONDS = int(os.getenv("FLAG_EPHEMERAL_SECONDS", "60"))
+CONFIG_FILE = Path("config.yaml")
+if not CONFIG_FILE.exists():
+    raise SystemExit(f"Missing {CONFIG_FILE}. Create it with DISCORD_TOKEN and OPENAI_API_KEY.")
+try:
+    _cfg = yaml.safe_load(CONFIG_FILE.read_text()) or {}
+except yaml.YAMLError as e:
+    raise SystemExit(f"Failed to parse {CONFIG_FILE}: {e}")
 
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+DISCORD_TOKEN  = str(_cfg.get("DISCORD_TOKEN", "") or "").strip()
+OPENAI_API_KEY = str(_cfg.get("OPENAI_API_KEY", "") or "").strip()
+
+DEBUG_MODE             = os.getenv("PIES_DEBUG", "0").strip() == "1"
+FLAG_EPHEMERAL_SECONDS = int(os.getenv("FLAG_EPHEMERAL_SECONDS", "60"))
+OPENAI_MODEL           = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 if not DISCORD_TOKEN:
-    raise SystemExit("Missing DISCORD_TOKEN in .env")
+    raise SystemExit("Missing DISCORD_TOKEN in config.yaml")
 if not OPENAI_API_KEY:
-    raise SystemExit("Missing OPENAI_API_KEY in .env")
+    raise SystemExit("Missing OPENAI_API_KEY in config.yaml")
 
 NO_MENTIONS = discord.AllowedMentions(everyone=False, users=False, roles=False, replied_user=False)
 MENTION_USER = discord.AllowedMentions(everyone=False, users=True, roles=False, replied_user=False)
@@ -59,20 +69,79 @@ if DEBUG_MODE:
 client_ai = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=60.0, max_retries=2)
 
 # ========== Files ==========
-RULES_FILE = Path("built_rules.json")
-USAGE_CSV  = Path("user_query_hist.csv")
-TRANSLATION_CSV = Path("translation_msg.csv")
-CSV_ENCODING = "utf-8-sig"
+# Layout:
+#   data/    — runtime state, bot-managed (rules, relay maps, CSVs, usage)
+#   profile/ — game profile, human-edited (desc.json, ABBR_MAP.json)
+DATA_DIR    = Path("data")
+PROFILE_DIR = Path("profile")
+DATA_DIR.mkdir(exist_ok=True)
+PROFILE_DIR.mkdir(exist_ok=True)
 
-RELAY_MAP_FILE = Path("relay_map.json")
+RULES_FILE      = DATA_DIR / "built_rules.json"
+USAGE_CSV       = DATA_DIR / "user_query_hist.csv"
+TRANSLATION_CSV = DATA_DIR / "translation_msg.csv"
+CSV_ENCODING    = "utf-8-sig"
+
+RELAY_MAP_FILE    = DATA_DIR / "relay_map.json"
+RELAY_ORIGIN_FILE = DATA_DIR / "relay_origin.json"
 relay_map: Dict[str, Dict[str, int]] = {}
-RELAY_ORIGIN_FILE = Path("relay_origin.json")
 relay_origin: Dict[str, int] = {}
 usage: Dict[str, int] = {}
 
 # ---------- 反向映射（用于“回复对齐”） ----------
-REVERSE_RELAY_FILE = Path("relay_reverse.json")
+REVERSE_RELAY_FILE = DATA_DIR / "relay_reverse.json"
 reverse_relay: Dict[str, Dict[str, int]] = {}
+
+# ========== Write-behind for hot-path JSON state ==========
+# Each relayed/translated message touches 2–3 large JSON files. Doing full
+# rewrites synchronously on the event loop adds tens of ms per message.
+# Instead, register serializers and mark dirty; a background task flushes
+# every FLUSH_INTERVAL seconds with atomic replace.
+FLUSH_INTERVAL = 2.0
+_dirty_paths: Set[Path] = set()
+_serializers: Dict[Path, Callable[[], str]] = {}
+
+
+def _register_persister(path: Path, serialize: Callable[[], str]) -> None:
+    _serializers[path] = serialize
+
+
+def _mark_dirty(path: Path) -> None:
+    _dirty_paths.add(path)
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _flush_dirty(force_paths: Optional[List[Path]] = None) -> None:
+    paths = list(force_paths) if force_paths is not None else list(_dirty_paths)
+    if force_paths is None:
+        _dirty_paths.clear()
+    for p in paths:
+        ser = _serializers.get(p)
+        if not ser:
+            continue
+        try:
+            _atomic_write(p, ser())
+            if force_paths is None:
+                _dirty_paths.discard(p)
+        except Exception as e:
+            log.warning(f"flush {p} failed: {e}")
+            _dirty_paths.add(p)  # retry next tick
+
+
+async def _state_flusher():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await asyncio.sleep(FLUSH_INTERVAL)
+            if _dirty_paths:
+                _flush_dirty()
+        except Exception as e:
+            log.warning(f"state flusher tick err: {e}")
 
 def load_reverse_relay():
     global reverse_relay
@@ -84,11 +153,13 @@ def load_reverse_relay():
     else:
         reverse_relay = {}
 
+
+_register_persister(REVERSE_RELAY_FILE, lambda: json.dumps(reverse_relay, ensure_ascii=False))
+_register_persister(RELAY_MAP_FILE,     lambda: json.dumps(relay_map,     ensure_ascii=False))
+_register_persister(RELAY_ORIGIN_FILE,  lambda: json.dumps(relay_origin,  ensure_ascii=False))
+
 def save_reverse_relay():
-    try:
-        REVERSE_RELAY_FILE.write_text(json.dumps(reverse_relay, ensure_ascii=False))
-    except Exception as e:
-        log.warning(f"Failed to write {REVERSE_RELAY_FILE}: {e}")
+    _mark_dirty(REVERSE_RELAY_FILE)
 
 def reverse_set(relayed_msg_id: int, src_msg_id: int, src_channel_id: int):
     reverse_relay[str(relayed_msg_id)] = {
@@ -151,8 +222,30 @@ class Bot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
 bot = Bot(intents=intents)
-our_message_ids = set()
-processed_ids = set()
+
+
+class BoundedIdSet:
+    """FIFO-bounded set for tracking recent message IDs without unbounded growth."""
+    __slots__ = ("_set", "_queue")
+
+    def __init__(self, max_size: int = 20000):
+        self._set: Set[int] = set()
+        self._queue: deque = deque(maxlen=max_size)
+
+    def add(self, item: int) -> None:
+        if item in self._set:
+            return
+        if self._queue.maxlen is not None and len(self._queue) == self._queue.maxlen:
+            self._set.discard(self._queue[0])
+        self._queue.append(item)
+        self._set.add(item)
+
+    def __contains__(self, item: int) -> bool:
+        return item in self._set
+
+
+our_message_ids: BoundedIdSet = BoundedIdSet(max_size=20000)
+processed_ids: BoundedIdSet = BoundedIdSet(max_size=20000)
 
 # ===== Inflight control =====
 MAX_INFLIGHT_TRANSLATES = 6
@@ -205,7 +298,7 @@ def script_bucket(text: str) -> str:
     cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf')
     hira_kata = sum(1 for ch in text if '\u3040' <= ch <= '\u30ff')
     hangul = sum(1 for ch in text if '\uac00' <= ch <= '\ud7af')
-    arabic = sum(1 for ch in text if '\u0600' <= ch <= '\u06ff' or '\u0750' <= '\u077f')
+    arabic = sum(1 for ch in text if '\u0600' <= ch <= '\u06ff' or '\u0750' <= ch <= '\u077f')
     total = max(len(text), 1)
     if _ratio(cjk, total) >= 0.2: return "zh"
     if _ratio(hira_kata, total) >= 0.2: return "ja"
@@ -293,8 +386,7 @@ def load_relay_map():
         except Exception: relay_map = {}
     else: relay_map = {}
 def save_relay_map():
-    try: RELAY_MAP_FILE.write_text(json.dumps(relay_map, ensure_ascii=False))
-    except Exception as e: log.warning(f"Failed to write {RELAY_MAP_FILE}: {e}")
+    _mark_dirty(RELAY_MAP_FILE)
 def map_set(src_msg_id: int, target_channel_id: int, target_msg_id: int):
     k = str(src_msg_id); ch = str(target_channel_id)
     d = relay_map.get(k) or {}; d[ch] = target_msg_id; relay_map[k] = d; save_relay_map()
@@ -307,8 +399,7 @@ def load_relay_origin():
         except Exception: relay_origin = {}
     else: relay_origin = {}
 def save_relay_origin():
-    try: RELAY_ORIGIN_FILE.write_text(json.dumps(relay_origin, ensure_ascii=False))
-    except Exception as e: log.warning(f"Failed to write {RELAY_ORIGIN_FILE}: {e}")
+    _mark_dirty(RELAY_ORIGIN_FILE)
 def origin_set(relayed_msg_id: int, origin_channel_id: int):
     relay_origin[str(relayed_msg_id)] = int(origin_channel_id); save_relay_origin()
 def origin_get(relayed_msg_id: int) -> Optional[int]:
@@ -326,8 +417,8 @@ BUDGET_DOLLARS_PER_DAY = float(os.getenv("OPENAI_BUDGET_DOLLARS_PER_DAY", "5.00"
 COST_PER_1M_INPUT  = float(os.getenv("OPENAI_COST_PER_1M_INPUT",  "1.25"))
 COST_PER_1M_OUTPUT = float(os.getenv("OPENAI_COST_PER_1M_OUTPUT", "10.00"))
 
-USAGE_STATE_FILE = Path("usage_state.json")
-USAGE_LOG_FILE   = Path("usage.log")
+USAGE_STATE_FILE = DATA_DIR / "usage_state.json"
+USAGE_LOG_FILE   = DATA_DIR / "usage.log"
 
 def _now_cst() -> datetime: return datetime.now(tz=CST)
 def _window_start(now: datetime) -> datetime:
@@ -415,9 +506,34 @@ async def openai_chat(messages: List[dict],
     except Exception as e:
         raise RuntimeError(f"OpenAI request failed: {e}")
 
-# ========== Abbreviation expansion（允许缺文件） ==========
+# ========== Game profile (desc.json + ABBR_MAP.json) ==========
+# Together these two files specialize this generic translator engine for one
+# game. desc.json carries the human-readable facts; ABBR_MAP.json carries the
+# in-game shorthand. Swap them out to retarget a different game.
+DEFAULT_DESC = {
+    "name": "",
+    "short_name": "Translator",
+    "genre": "",
+    "tone": "natural tone",
+    "preserve": "names, codes, @mentions, URLs, emojis, numbers, and times",
+    "language_styles": {},
+    "activity": "Translator",
+}
 try:
-    with open("ABBR_MAP.json", "r", encoding="utf-8") as f:
+    with open(PROFILE_DIR / "desc.json", "r", encoding="utf-8") as f:
+        _desc_data = json.load(f) or {}
+    DESC = {**DEFAULT_DESC, **_desc_data}
+    # language_styles needs a deep-merge so partial profiles still get defaults
+    DESC["language_styles"] = {**DEFAULT_DESC["language_styles"], **(_desc_data.get("language_styles") or {})}
+except FileNotFoundError:
+    log.info("profile/desc.json not found; running as a generic translator.")
+    DESC = dict(DEFAULT_DESC)
+except Exception as _e:
+    log.warning(f"desc.json not loaded, falling back to generic: {_e}")
+    DESC = dict(DEFAULT_DESC)
+
+try:
+    with open(PROFILE_DIR / "ABBR_MAP.json", "r", encoding="utf-8") as f:
         _abbr_data = json.load(f); ABBR_MAP = _abbr_data.get("ABBR_MAP", {}) or {}
 except Exception as _e:
     log.warning(f"ABBR_MAP.json not loaded, fallback to empty: {_e}")
@@ -429,14 +545,30 @@ def expand_abbrs(text: str) -> str:
 
 # Prompts
 SYSTEM_DETECT = "Return the ISO 639-1 language code of the user text (e.g., en, ja, zh, ko, es). Output only the code."
-SYSTEM_TRANSLATE = (
-    "You are a translator for the mobile strategy game 'Last War: Survival Game'. "
-    "Translate the user's text into the specified target language with a concise gamer tone. "
-    "Preserve player names, alliance tags, coordinates, codes, @mentions, URLs, emojis, numbers, and times. "
-    "Do NOT add explanations, parentheses, or any extra notes. "
-    "If the input is already in the target language, return it verbatim. "
-    "If acronyms were expanded before translation, translate them naturally; do not re-annotate."
-)
+
+
+def _build_system_translate(desc: dict, has_abbrs: bool) -> str:
+    parts: List[str] = []
+    name = (desc.get("name") or "").strip()
+    genre = (desc.get("genre") or "").strip()
+    if name:
+        subject = f"the {genre} '{name}'" if genre else f"'{name}'"
+        parts.append(f"You are a translator for {subject}.")
+    else:
+        parts.append("You are a translator.")
+    tone = (desc.get("tone") or "natural tone").strip()
+    parts.append(f"Translate the user's text into the specified target language with a {tone}.")
+    preserve = (desc.get("preserve") or "").strip()
+    if preserve:
+        parts.append(f"Preserve {preserve}.")
+    parts.append("Do NOT add explanations, parentheses, or any extra notes.")
+    parts.append("If the input is already in the target language, return it verbatim.")
+    if has_abbrs:
+        parts.append("If acronyms were expanded before translation, translate them naturally; do not re-annotate.")
+    return " ".join(parts)
+
+
+SYSTEM_TRANSLATE = _build_system_translate(DESC, bool(ABBR_MAP))
 
 # ========= Limits & regex for heuristics =========
 EMBED_DESC_LIMIT = 4000
@@ -534,15 +666,13 @@ async def detect_lang(text: str) -> str:
 
 async def translate_to(text: str, target_code: str) -> str:
     expanded = expand_abbrs(text); tnorm = _norm_lang(target_code)
-    ja_style = ("When translating into Japanese, always use polite form (丁寧語, です/ます調). "
-                "Avoid slang or overly casual phrasing. Keep it natural but respectful."
-                if tnorm == "ja" else "")
+    lang_style = (DESC.get("language_styles") or {}).get(tnorm, "")
     force_rule = (f"Output MUST be in {LANG_NAME.get(tnorm, 'the target language')} only. "
                   f"Never return the source text. No brackets, no explanations.")
     try:
         msgs = [{"role": "system", "content": SYSTEM_TRANSLATE},
                 {"role": "system", "content": force_rule}]
-        if ja_style: msgs.append({"role": "system", "content": ja_style})
+        if lang_style: msgs.append({"role": "system", "content": lang_style})
         msgs.append({"role": "user", "content": json.dumps({"target_lang": tnorm, "text": expanded}, ensure_ascii=False)})
 
         async with TRANSLATE_SEM:
@@ -554,7 +684,7 @@ async def translate_to(text: str, target_code: str) -> str:
             strict_rule = (f"Translate into {LANG_NAME.get(tnorm, 'the target language')} ONLY. "
                            f"Return ONLY the translated text.")
             msgs2 = [{"role":"system","content":strict_rule}]
-            if ja_style: msgs2.insert(0, {"role":"system","content":ja_style})
+            if lang_style: msgs2.insert(0, {"role":"system","content":lang_style})
             msgs2.append({"role":"user","content":expanded})
             async with TRANSLATE_SEM:
                 out2, _, _ = await openai_chat(messages=msgs2, temperature=0.0, timeout_sec=60.0)
@@ -567,12 +697,17 @@ async def translate_to(text: str, target_code: str) -> str:
 async def safe_translate(text: str, target_code: Optional[str]) -> Tuple[str, bool]:
     if not text or not target_code: return text or "", False
     tnorm = _norm_lang(target_code)
+    # Cheap, deterministic short-circuits before any OpenAI call.
     if is_already_target_heuristic(text, tnorm): return text, False
-    try:
-        code = await detect_lang(text)
-        if lang_similarity_pct(code, tnorm) >= 90: return text, False
-    except Exception:
-        return text, False
+    if fast_lang_agree(text, tnorm): return text, False
+    # If we don't need LLM-level detection (script bucket already disambiguates),
+    # we can skip detect_lang entirely and go straight to translation.
+    if need_llm_detect(text, tnorm):
+        try:
+            code = await detect_lang(text)
+            if lang_similarity_pct(code, tnorm) >= 90: return text, False
+        except Exception:
+            return text, False
     parts = split_long_text(text, limit=1800); outs: List[str] = []; changed = False
     for p in parts:
         out = await translate_to(p, tnorm)
@@ -598,7 +733,7 @@ def make_embed_card(author: discord.abc.User, translated_text: str, footer_autod
     emb = discord.Embed(description=translated_text or "")
     name = author.display_name if isinstance(author, discord.Member) else author.name
     icon = author_avatar_url(author)
-    emb.set_author(name=name, icon_url=icon if icon else discord.Embed.Empty)
+    emb.set_author(name=name, icon_url=icon or None)
     if footer_autodelete_seconds:
         emb.set_footer(text=f"Auto-delete in {footer_autodelete_seconds}s")
     return emb
@@ -698,8 +833,8 @@ async def watch_translation_csv_and_apply_edits():
                                 if old:
                                     new_emb = discord.Embed(description=desc)
                                     if old.author and (old.author.name or old.author.icon_url):
-                                        new_emb.set_author(name=old.author.name or discord.Embed.Empty,
-                                                           icon_url=old.author.icon_url or discord.Embed.Empty)
+                                        new_emb.set_author(name=old.author.name or "",
+                                                           icon_url=old.author.icon_url or None)
                                     if old.footer and old.footer.text:
                                         new_emb.set_footer(text=old.footer.text)
                                 else:
@@ -716,32 +851,38 @@ async def watch_translation_csv_and_apply_edits():
             log.warning(f"translation csv watcher loop err: {e}")
 
 # ========= backfill into translation_msg.csv =========
-def _csv_has_msg_id(mid: int) -> bool:
+def _csv_existing_msg_ids() -> Set[int]:
+    ids: Set[int] = set()
     try:
         with TRANSLATION_CSV.open("r", newline="", encoding=CSV_ENCODING) as f:
-            r = csv.DictReader(f)
-            for row in r:
-                if str(row.get("msg_id", "")).strip() == str(mid): return True
+            for row in csv.DictReader(f):
+                try:
+                    mid = int((row.get("msg_id") or "0").strip() or 0)
+                    if mid > 0: ids.add(mid)
+                except Exception:
+                    continue
     except Exception:
         pass
-    return False
+    return ids
 
 async def _backfill_channel(channel: discord.TextChannel, *, days: Optional[int],
                             max_msgs: Optional[int], default_lang: Optional[str]) -> Tuple[int, int]:
     scanned = added = 0
     after_dt = None
     if days and days > 0:
-        after_dt = datetime.utcnow() - timedelta(days=days)
+        after_dt = datetime.now(timezone.utc) - timedelta(days=days)
 
     history_kwargs = {"limit": (max_msgs if (isinstance(max_msgs, int) and max_msgs > 0) else None)}
     if after_dt: history_kwargs["after"] = after_dt
+
+    existing_ids: Set[int] = _csv_existing_msg_ids()
 
     try:
         async for m in channel.history(**history_kwargs):
             scanned += 1
             if not (m.author and bot.user and m.author.id == bot.user.id):
                 continue
-            if _csv_has_msg_id(m.id):
+            if m.id in existing_ids:
                 continue
             if m.embeds:
                 e = m.embeds[0]
@@ -924,7 +1065,7 @@ async def slash_help(interaction: discord.Interaction):
         "• `/backfill_csv [channel] [days] [max_per_channel]` — backfill historical bot messages into CSV\n"
         "• `/syn_his channel:<#dest> [max_count] [days] [skip_existing]` — sync history from linked channel\n"
         "• `/correct [size:<50|100|200>]` — scan last N CSV rows; fix texts not in target language\n"
-        f"\n**Live edit:** edit `{TRANSLATION_CSV.name}` → change `text` → the message will be edited in Discord.\n"
+        f"\n**Live edit:** edit `{TRANSLATION_CSV}` → change `text` → the message will be edited in Discord.\n"
         "Notes:\n"
         "• CSV uses `utf-8-sig` to avoid mojibake in Excel.\n"
         "• `created_at` in CSV is the REAL message creation time (converted to CST).\n"
@@ -988,7 +1129,7 @@ async def slash_syn_his(interaction: discord.Interaction,
 
     after_dt = None
     if days and days > 0:
-        after_dt = datetime.utcnow() - timedelta(days=days)
+        after_dt = datetime.now(timezone.utc) - timedelta(days=days)
 
     scanned = sent_ok = skipped = 0
     failed: List[int] = []
@@ -1509,6 +1650,7 @@ async def on_ready():
     load_rules(); load_usage(); load_relay_map(); load_relay_origin(); load_reverse_relay()
     ensure_translation_csv()
     asyncio.create_task(watch_translation_csv_and_apply_edits())
+    asyncio.create_task(_state_flusher())
     _reset_if_needed(_load_usage_state())
 
     try:
@@ -1533,27 +1675,17 @@ async def on_ready():
     log.info(f"Translation CSV: {TRANSLATION_CSV.resolve()}")
     log.info(f"OpenAI model: {OPENAI_MODEL}")
     if DEBUG_MODE: log.debug("DEBUG MODE is ON")
-    activity = discord.Game("⚔ LastWar:Survival")
+    activity = discord.Game(DESC.get("activity") or DESC.get("short_name") or "Translator")
     await bot.change_presence(status=discord.Status.online, activity=activity)
-
-# ========== Relay map/origin loaders ==========
-def load_relay_map():
-    global relay_map
-    if RELAY_MAP_FILE.exists():
-        try: relay_map = json.loads(RELAY_MAP_FILE.read_text())
-        except Exception: relay_map = {}
-    else: relay_map = {}
-
-def load_relay_origin():
-    global relay_origin
-    if RELAY_ORIGIN_FILE.exists():
-        try: relay_origin = json.loads(RELAY_ORIGIN_FILE.read_text())
-        except Exception: relay_origin = {}
-    else: relay_origin = {}
 
 # ========== Main ==========
 def main():
-    bot.run(DISCORD_TOKEN)
+    try:
+        bot.run(DISCORD_TOKEN)
+    finally:
+        if _dirty_paths:
+            log.info(f"Flushing {len(_dirty_paths)} dirty state file(s) on shutdown.")
+            _flush_dirty()
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,11 @@
+{
+  "name": "Last War: Survival Game",
+  "short_name": "LastWar:Survival",
+  "genre": "mobile strategy game",
+  "tone": "concise gamer tone",
+  "preserve": "player names, alliance tags, coordinates, codes, @mentions, URLs, emojis, numbers, and times",
+  "language_styles": {
+    "ja": "When translating into Japanese, always use polite form (丁寧語, です/ます調). Avoid slang or overly casual phrasing. Keep it natural but respectful."
+  },
+  "activity": "⚔ LastWar:Survival"
+}

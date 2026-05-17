@@ -1,5 +1,6 @@
 archives/*
 *.ipynb
-translation_msg.csv
-tamu_ai.json
+data/translation_msg.csv
 config.yaml
+__pycache__/
+.claude/
