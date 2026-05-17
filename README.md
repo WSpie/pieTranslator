@@ -2,98 +2,101 @@
 
 [日本語](README.ja.md)
 
-A Discord bot that bridges chat across languages, tuned for one mobile game at a time. Pair a `desc.json` (game profile) with an `ABBR_MAP.json` (in-game shorthand) and the rest of the code is a generic engine.
+A Discord bot for cross-language chat. Set up right now for *Last War: Survival Game*. Swap two files in `profile/` to point it at a different game. Everything else stays the same.
 
 ## What it does
 
-- **Auto-translate** messages in any channel that has a rule, into that channel's target language.
-- **Link two channels** in different languages — messages are mirrored both ways, reply chains preserved.
-- **Flag-emoji translation** — react with a country flag (🇯🇵 / 🇺🇸 / 🇰🇷 / …) on any message and the bot replies with that translation. Auto-deletes after 60s.
-- **Abbreviation expansion** — expand in-game shorthand (e.g. `VS` → `Duel`) before translating, so the model translates the meaning instead of the acronym.
-- **Edit by CSV** — every translation is logged to `translation_msg.csv`. Edit the `text` column and the bot re-edits the Discord message.
-- **Daily budget** — caps OpenAI spend per day; window resets at 19:00 CST.
+If a channel has a language rule, the bot translates new messages there and replies with an embed.
+
+Link two channels in different languages and the bot mirrors messages both ways. Reply threading stays consistent across the pair.
+
+React to any message with a country flag (🇯🇵, 🇺🇸, 🇰🇷, ...) and the bot posts a one-off translation. It auto-deletes after a minute so flag spam doesn't pile up.
+
+Game shorthand from `profile/ABBR_MAP.json` (VS, DS, mud, ...) gets expanded inline before the model sees the message, so it translates the meaning instead of the acronym.
+
+Every translation lands in `data/translation_msg.csv`. Edit the `text` column there and the bot edits the matching Discord message. That's the bulk-proofreading path: fix it in the spreadsheet, channels update.
+
+There is a daily OpenAI budget cap (default $5, configurable). The window resets at 19:00 CST.
 
 ## Setup
 
-1. **Install dependencies**
+Install dependencies:
 
-   ```
-   pip install "discord.py>=2.0" openai python-dotenv pyyaml certifi
-   ```
+```
+pip install "discord.py>=2.0" openai python-dotenv pyyaml certifi
+```
 
-   Tested on Python 3.10 with discord.py 2.6.
+Tested on Python 3.10 with discord.py 2.6.
 
-2. **Create `config.yaml`** (gitignored, holds secrets):
+Put secrets in `config.yaml` (gitignored):
 
-   ```yaml
-   DISCORD_TOKEN: your-discord-bot-token
-   OPENAI_API_KEY: sk-...
-   ```
+```yaml
+DISCORD_TOKEN: your-discord-bot-token
+OPENAI_API_KEY: sk-...
+```
 
-3. **`.env`** (optional runtime knobs):
+Non-secret runtime knobs go in `.env`:
 
-   ```
-   OPENAI_MODEL=gpt-4o-mini
-   PIES_DEBUG=0
-   FLAG_EPHEMERAL_SECONDS=60
-   ```
+```
+OPENAI_MODEL=gpt-4o-mini
+PIES_DEBUG=0
+FLAG_EPHEMERAL_SECONDS=60
+```
 
-4. **`desc.json`** — describe the game. Used to build the translator's system prompt. If missing, the bot runs as a generic translator.
+The two files in `profile/` describe the game. If `desc.json` is missing the bot still runs, just as a generic translator with no game context.
 
-5. **`ABBR_MAP.json`** — game shorthand to expand before translation. Optional.
+Then:
 
-6. **Run**
-
-   ```
-   python pies_translator_OPENAI.py
-   ```
+```
+python pies_translator_OPENAI.py
+```
 
 ## Slash commands
 
 | Command | What it does |
 |---------|--------------|
-| `/add channel language [flag]` | Set a channel's target language. |
-| `/update channel [language] [flag]` | Update an existing rule. |
-| `/del channel` | Remove a rule. |
-| `/add_flag channel` | Enable flag-emoji translation only (language unchanged). |
-| `/link channel1 channel2` | Bidirectionally mirror two channels. |
-| `/syn_his channel [max_count] [days]` | Backfill recent messages from the linked channel. |
+| `/add channel language [flag]` | Give a channel a target language. |
+| `/update channel [language] [flag]` | Change an existing rule. |
+| `/del channel` | Drop a rule. |
+| `/add_flag channel` | Turn on flag-emoji mode without changing the language. |
+| `/link channel1 channel2` | Mirror two channels both ways. |
+| `/syn_his channel [max_count] [days]` | Pull recent messages from the linked channel and translate them across. |
 | `/backfill_csv [channel] [days]` | Backfill historical bot messages into the CSV log. |
-| `/correct [size]` | Re-translate rows in the CSV that aren't in their target language. |
-| `/usage` | Show today's OpenAI token / cost usage. |
-| `/help` | List commands. |
-| `/sync` | Re-sync slash commands to the current server. |
+| `/correct [size]` | Scan the last N rows of the CSV and re-translate any that aren't in their target language. |
+| `/usage` | Today's OpenAI tokens and cost. |
+| `/help` | List the commands. |
+| `/sync` | Re-register slash commands on this server. |
 
-All commands require Administrator / Manage Server / Manage Channels / Manage Roles / Manage Messages, or being the server owner.
+All of these need Administrator / Manage Server / Manage Channels / Manage Roles / Manage Messages, or to be the server owner.
 
-## Targeting a different game
+## Pointing it at a different game
 
-The two files in `profile/` are the only things tied to *Last War: Survival Game*. To retarget:
+Two files carry everything game-specific:
 
-- Edit `profile/desc.json` — name, genre, tone, what to preserve, per-language style overrides, Discord activity text.
-- Edit `profile/ABBR_MAP.json` — the game's in-chat shorthand.
+- `profile/desc.json`: the game's name, genre, what tone the translations should use, what to preserve verbatim, per-language style notes (the current setup keeps Japanese polite, for example), and the bot's Discord status string.
+- `profile/ABBR_MAP.json`: in-chat shorthand for the game.
 
-Nothing else in the codebase needs to change.
+Change those two and the rest of the code stays put.
 
 ## Layout
 
 ```
 .
 ├── pies_translator_OPENAI.py     main program
-├── config.yaml                   secrets (gitignored)
+├── config.yaml                   secrets, gitignored
 ├── .env                          non-secret runtime knobs
 ├── README.md / README.ja.md
-├── profile/                      game profile — edit to retarget
+├── profile/                      game profile, edit to retarget
 │   ├── desc.json
 │   └── ABBR_MAP.json
-├── data/                         runtime state, bot-managed
+├── data/                         runtime state, bot manages this
 │   ├── built_rules.json          per-channel rules
 │   ├── relay_map.json            cross-channel relay state
 │   ├── relay_reverse.json
 │   ├── relay_origin.json
-│   ├── translation_msg.csv       translation log — edit to re-edit Discord
+│   ├── translation_msg.csv       translation log, editable
 │   ├── user_query_hist.csv       per-user query counts
 │   ├── usage_state.json          daily OpenAI budget snapshot
 │   └── usage.log
-└── archives/                     older versions, kept for reference
+└── archives/                     older versions kept around
 ```
