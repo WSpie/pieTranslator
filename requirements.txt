@@ -1,0 +1,5 @@
+discord.py==2.6.3
+openai==1.97.0
+python-dotenv==1.0.1
+PyYAML==6.0.2
+certifi==2025.11.12

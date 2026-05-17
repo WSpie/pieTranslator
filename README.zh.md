@@ -23,7 +23,7 @@ OpenAI 有日预算上限（默认 $5，可改）。窗口每天 19:00 CST 重�
 装依赖：
 
 ```
-pip install "discord.py>=2.0" openai python-dotenv pyyaml certifi
+pip install -r requirements.txt
 ```
 
 在 Python 3.10 + discord.py 2.6 上验证过。
