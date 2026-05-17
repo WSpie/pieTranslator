@@ -3,12 +3,11 @@
 
 import os
 import re
-import csv
 import json
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple, Set, Callable
+from typing import Dict, Optional, List, Tuple, Set
 from collections import defaultdict, deque
 
 import yaml
@@ -21,6 +20,8 @@ from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
 
+import db
+
 # ---- TLS fallback ----
 try:
     import certifi
@@ -30,28 +31,40 @@ except Exception:
     pass
 
 # ========== Config ==========
-# Secrets live in config.yaml (gitignored). Non-secret runtime knobs stay in .env.
+# Secrets: env vars take precedence (Heroku-style). config.yaml is a fallback
+# for local development. Non-secret runtime knobs stay in .env.
 load_dotenv()
 
+_cfg: dict = {}
 CONFIG_FILE = Path("config.yaml")
-if not CONFIG_FILE.exists():
-    raise SystemExit(f"Missing {CONFIG_FILE}. Create it with DISCORD_TOKEN and OPENAI_API_KEY.")
-try:
-    _cfg = yaml.safe_load(CONFIG_FILE.read_text()) or {}
-except yaml.YAMLError as e:
-    raise SystemExit(f"Failed to parse {CONFIG_FILE}: {e}")
+if CONFIG_FILE.exists():
+    try:
+        _cfg = yaml.safe_load(CONFIG_FILE.read_text()) or {}
+    except yaml.YAMLError as e:
+        raise SystemExit(f"Failed to parse {CONFIG_FILE}: {e}")
 
-DISCORD_TOKEN  = str(_cfg.get("DISCORD_TOKEN", "") or "").strip()
-OPENAI_API_KEY = str(_cfg.get("OPENAI_API_KEY", "") or "").strip()
+
+def _secret(key: str) -> str:
+    return (os.getenv(key) or str(_cfg.get(key, "") or "")).strip()
+
+
+DISCORD_TOKEN  = _secret("DISCORD_TOKEN")
+OPENAI_API_KEY = _secret("OPENAI_API_KEY")
+DATABASE_URL   = _secret("DATABASE_URL")
 
 DEBUG_MODE             = os.getenv("PIES_DEBUG", "0").strip() == "1"
 FLAG_EPHEMERAL_SECONDS = int(os.getenv("FLAG_EPHEMERAL_SECONDS", "60"))
 OPENAI_MODEL           = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 if not DISCORD_TOKEN:
-    raise SystemExit("Missing DISCORD_TOKEN in config.yaml")
+    raise SystemExit("Missing DISCORD_TOKEN: set env var or add it to config.yaml")
 if not OPENAI_API_KEY:
-    raise SystemExit("Missing OPENAI_API_KEY in config.yaml")
+    raise SystemExit("Missing OPENAI_API_KEY: set env var or add it to config.yaml")
+if not DATABASE_URL:
+    raise SystemExit(
+        "Missing DATABASE_URL: set env var (Heroku Postgres injects it) "
+        "or add it to config.yaml for local dev."
+    )
 
 NO_MENTIONS = discord.AllowedMentions(everyone=False, users=False, roles=False, replied_user=False)
 MENTION_USER = discord.AllowedMentions(everyone=False, users=True, roles=False, replied_user=False)
@@ -68,105 +81,57 @@ if DEBUG_MODE:
 # - 单次请求仍可用 asyncio.wait_for 进一步收紧
 client_ai = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=60.0, max_retries=2)
 
-# ========== Files ==========
-# Layout:
-#   data/    — runtime state, bot-managed (rules, relay maps, CSVs, usage)
-#   profile/ — game profile, human-edited (desc.json, ABBR_MAP.json)
-DATA_DIR    = Path("data")
+# ========== Storage ==========
+# All runtime state lives in Postgres (via db.py) so the bot can run on
+# ephemeral hosts like Heroku. profile/ stays on disk — it's human-edited
+# game profile that ships with the code.
 PROFILE_DIR = Path("profile")
-DATA_DIR.mkdir(exist_ok=True)
 PROFILE_DIR.mkdir(exist_ok=True)
 
-RULES_FILE      = DATA_DIR / "built_rules.json"
-USAGE_CSV       = DATA_DIR / "user_query_hist.csv"
-TRANSLATION_CSV = DATA_DIR / "translation_msg.csv"
-CSV_ENCODING    = "utf-8-sig"
-
-RELAY_MAP_FILE    = DATA_DIR / "relay_map.json"
-RELAY_ORIGIN_FILE = DATA_DIR / "relay_origin.json"
+# In-memory caches mirror the DB for hot-read paths. Writes update the
+# cache synchronously and schedule a DB upsert via _fire_db().
 relay_map: Dict[str, Dict[str, int]] = {}
 relay_origin: Dict[str, int] = {}
+reverse_relay: Dict[str, Dict[str, int]] = {}
 usage: Dict[str, int] = {}
 
-# ---------- 反向映射（用于“回复对齐”） ----------
-REVERSE_RELAY_FILE = DATA_DIR / "relay_reverse.json"
-reverse_relay: Dict[str, Dict[str, int]] = {}
 
-# ========== Write-behind for hot-path JSON state ==========
-# Each relayed/translated message touches 2–3 large JSON files. Doing full
-# rewrites synchronously on the event loop adds tens of ms per message.
-# Instead, register serializers and mark dirty; a background task flushes
-# every FLUSH_INTERVAL seconds with atomic replace.
-FLUSH_INTERVAL = 2.0
-_dirty_paths: Set[Path] = set()
-_serializers: Dict[Path, Callable[[], str]] = {}
-
-
-def _register_persister(path: Path, serialize: Callable[[], str]) -> None:
-    _serializers[path] = serialize
-
-
-def _mark_dirty(path: Path) -> None:
-    _dirty_paths.add(path)
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
-
-
-def _flush_dirty(force_paths: Optional[List[Path]] = None) -> None:
-    paths = list(force_paths) if force_paths is not None else list(_dirty_paths)
-    if force_paths is None:
-        _dirty_paths.clear()
-    for p in paths:
-        ser = _serializers.get(p)
-        if not ser:
-            continue
+def _fire_db(coro) -> None:
+    """Schedule a DB write from sync code. Errors are logged, not raised."""
+    try:
+        asyncio.create_task(_safe_run_db(coro))
+    except RuntimeError:
+        # No running loop (shouldn't happen in normal flow — all mutators
+        # are called from coroutine context). Drop and warn.
         try:
-            _atomic_write(p, ser())
-            if force_paths is None:
-                _dirty_paths.discard(p)
-        except Exception as e:
-            log.warning(f"flush {p} failed: {e}")
-            _dirty_paths.add(p)  # retry next tick
-
-
-async def _state_flusher():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        try:
-            await asyncio.sleep(FLUSH_INTERVAL)
-            if _dirty_paths:
-                _flush_dirty()
-        except Exception as e:
-            log.warning(f"state flusher tick err: {e}")
-
-def load_reverse_relay():
-    global reverse_relay
-    if REVERSE_RELAY_FILE.exists():
-        try:
-            reverse_relay = json.loads(REVERSE_RELAY_FILE.read_text())
+            coro.close()
         except Exception:
-            reverse_relay = {}
-    else:
+            pass
+        log.warning("_fire_db: no running event loop; dropping write")
+
+
+async def _safe_run_db(coro) -> None:
+    try:
+        await coro
+    except Exception as e:
+        log.warning(f"DB write failed: {e}")
+
+
+async def load_reverse_relay():
+    global reverse_relay
+    try:
+        reverse_relay = await db.load_relay_reverse()
+    except Exception as e:
+        log.warning(f"load_reverse_relay failed: {e}")
         reverse_relay = {}
 
-
-_register_persister(REVERSE_RELAY_FILE, lambda: json.dumps(reverse_relay, ensure_ascii=False))
-_register_persister(RELAY_MAP_FILE,     lambda: json.dumps(relay_map,     ensure_ascii=False))
-_register_persister(RELAY_ORIGIN_FILE,  lambda: json.dumps(relay_origin,  ensure_ascii=False))
-
-def save_reverse_relay():
-    _mark_dirty(REVERSE_RELAY_FILE)
 
 def reverse_set(relayed_msg_id: int, src_msg_id: int, src_channel_id: int):
     reverse_relay[str(relayed_msg_id)] = {
         "src_msg_id": int(src_msg_id),
         "src_channel_id": int(src_channel_id),
     }
-    save_reverse_relay()
+    _fire_db(db.upsert_relay_reverse(int(relayed_msg_id), int(src_msg_id), int(src_channel_id)))
 
 def reverse_get(relayed_msg_id: int) -> Optional[Tuple[int, int]]:
     d = reverse_relay.get(str(relayed_msg_id))
@@ -183,31 +148,16 @@ def user_label(u: discord.abc.User) -> str:
 def bump(u: discord.abc.User):
     key = user_label(u)
     usage[key] = usage.get(key, 0) + 1
-    save_usage()
+    _fire_db(db.bump_user_usage(key, 1))
 
-def load_usage():
-    usage.clear()
-    if not USAGE_CSV.exists():
-        return
-    try:
-        with USAGE_CSV.open("r", newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                name = row.get("username", "").strip()
-                n = int(row.get("query_counts", "0") or 0)
-                if name:
-                    usage[name] = n
-    except Exception as e:
-        log.warning(f"Failed to read {USAGE_CSV}: {e}")
 
-def save_usage():
+async def load_usage():
+    global usage
     try:
-        with USAGE_CSV.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["username", "query_counts"])
-            w.writeheader()
-            for name, n in sorted(usage.items(), key=lambda x: (-x[1], x[0])):
-                w.writerow({"username": name, "query_counts": n})
+        usage = await db.load_user_usage()
     except Exception as e:
-        log.error(f"Failed to write {USAGE_CSV}: {e}")
+        log.warning(f"load_usage failed: {e}")
+        usage = {}
 
 # ========== Discord Client ==========
 intents = Intents.default()
@@ -333,75 +283,81 @@ def text_is_meaningful(text: str) -> bool:
 Rules = Dict[str, Dict[str, object]]
 rules: Rules = {}
 
-def load_rules():
+async def load_rules():
     global rules
-    if RULES_FILE.exists():
-        try:
-            rules = json.loads(RULES_FILE.read_text())
-            for _, v in list(rules.items()):
-                if "language" not in v:
-                    v["language"] = None
-                v.setdefault("flag", False)
-                v.setdefault("link_channel_id", None)
-        except Exception as e:
-            log.warning(f"Failed to load {RULES_FILE}: {e}")
-            rules = {}
-    else:
+    try:
+        rules = await db.load_rules()
+    except Exception as e:
+        log.warning(f"load_rules failed: {e}")
         rules = {}
 
-def save_rules():
-    try:
-        RULES_FILE.write_text(json.dumps(rules, indent=2, ensure_ascii=False))
-    except Exception as e:
-        log.error(f"Failed to write {RULES_FILE}: {e}")
+
+def _persist_rule(cid: int) -> None:
+    r = rules.get(str(cid)) or {}
+    _fire_db(db.upsert_rule(
+        int(cid),
+        r.get("language"),
+        bool(r.get("flag", False)),
+        int(r["link_channel_id"]) if r.get("link_channel_id") is not None else None,
+    ))
+
 
 def get_rule(cid: int) -> Optional[dict]: return rules.get(str(cid))
 def set_rule(cid: int, language: Optional[str], flag: bool = False, link_channel_id: Optional[int] = None):
-    rules[str(cid)] = {"language": language, "flag": flag, "link_channel_id": link_channel_id}; save_rules()
+    rules[str(cid)] = {"language": language, "flag": flag, "link_channel_id": link_channel_id}
+    _persist_rule(cid)
 def update_rule(cid: int, language: Optional[str] = None, flag: Optional[bool] = None):
     r = rules.get(str(cid))
     if not r: return False
     if language is not None: r["language"] = language
     if flag is not None: r["flag"] = flag
-    save_rules(); return True
+    _persist_rule(cid); return True
 def link_channels(a: int, b: int):
     if a == b: return
     ra = rules.get(str(a)) or {"language": None, "flag": False, "link_channel_id": None}
     rb = rules.get(str(b)) or {"language": None, "flag": False, "link_channel_id": None}
     ra["link_channel_id"] = b; rb["link_channel_id"] = a
-    rules[str(a)] = ra; rules[str(b)] = rb; save_rules()
+    rules[str(a)] = ra; rules[str(b)] = rb
+    _persist_rule(a); _persist_rule(b)
 def del_rule(cid: int):
     r = rules.get(str(cid))
     if r and r.get("link_channel_id"):
         other = str(int(r["link_channel_id"]))
         if other in rules and rules[other].get("link_channel_id") == cid:
             rules[other]["link_channel_id"] = None
-    rules.pop(str(cid), None); save_rules()
+            _persist_rule(int(other))
+    rules.pop(str(cid), None)
+    _fire_db(db.delete_rule(int(cid)))
 
 # ========== Relay map/origin ==========
-def load_relay_map():
+async def load_relay_map():
     global relay_map
-    if RELAY_MAP_FILE.exists():
-        try: relay_map = json.loads(RELAY_MAP_FILE.read_text())
-        except Exception: relay_map = {}
-    else: relay_map = {}
-def save_relay_map():
-    _mark_dirty(RELAY_MAP_FILE)
+    try:
+        relay_map = await db.load_relay_map()
+    except Exception as e:
+        log.warning(f"load_relay_map failed: {e}")
+        relay_map = {}
+
 def map_set(src_msg_id: int, target_channel_id: int, target_msg_id: int):
     k = str(src_msg_id); ch = str(target_channel_id)
-    d = relay_map.get(k) or {}; d[ch] = target_msg_id; relay_map[k] = d; save_relay_map()
+    d = relay_map.get(k) or {}; d[ch] = int(target_msg_id); relay_map[k] = d
+    _fire_db(db.upsert_relay_map(int(src_msg_id), int(target_channel_id), int(target_msg_id)))
+
 def map_get(src_msg_id: int, target_channel_id: int) -> Optional[int]:
     return (relay_map.get(str(src_msg_id)) or {}).get(str(target_channel_id))
-def load_relay_origin():
+
+async def load_relay_origin():
     global relay_origin
-    if RELAY_ORIGIN_FILE.exists():
-        try: relay_origin = json.loads(RELAY_ORIGIN_FILE.read_text())
-        except Exception: relay_origin = {}
-    else: relay_origin = {}
-def save_relay_origin():
-    _mark_dirty(RELAY_ORIGIN_FILE)
+    try:
+        relay_origin = await db.load_relay_origin()
+    except Exception as e:
+        log.warning(f"load_relay_origin failed: {e}")
+        relay_origin = {}
+
 def origin_set(relayed_msg_id: int, origin_channel_id: int):
-    relay_origin[str(relayed_msg_id)] = int(origin_channel_id); save_relay_origin()
+    relay_origin[str(relayed_msg_id)] = int(origin_channel_id)
+    _fire_db(db.upsert_relay_origin(int(relayed_msg_id), int(origin_channel_id)))
+
 def origin_get(relayed_msg_id: int) -> Optional[int]:
     v = relay_origin.get(str(relayed_msg_id)); return int(v) if v is not None else None
 
@@ -417,34 +373,42 @@ BUDGET_DOLLARS_PER_DAY = float(os.getenv("OPENAI_BUDGET_DOLLARS_PER_DAY", "5.00"
 COST_PER_1M_INPUT  = float(os.getenv("OPENAI_COST_PER_1M_INPUT",  "1.25"))
 COST_PER_1M_OUTPUT = float(os.getenv("OPENAI_COST_PER_1M_OUTPUT", "10.00"))
 
-USAGE_STATE_FILE = DATA_DIR / "usage_state.json"
-USAGE_LOG_FILE   = DATA_DIR / "usage.log"
-
 def _now_cst() -> datetime: return datetime.now(tz=CST)
 def _window_start(now: datetime) -> datetime:
     today_reset = now.replace(hour=DAILY_RESET_HOUR, minute=0, second=0, microsecond=0)
     return today_reset if now >= today_reset else today_reset - timedelta(days=1)
 def _window_label(now: datetime) -> str: return now.strftime("%m/%d/%Y")
+
+# Mirror of the DB usage_state row. Sync reads from memory; mutations fire
+# a DB upsert.
+_usage_state_mem: Dict[str, object] = dict(db.DEFAULT_USAGE_STATE)
+
+async def load_usage_state_from_db():
+    global _usage_state_mem
+    try:
+        _usage_state_mem = await db.load_usage_state()
+    except Exception as e:
+        log.warning(f"load_usage_state failed: {e}")
+        _usage_state_mem = dict(db.DEFAULT_USAGE_STATE)
+
 def _load_usage_state() -> dict:
-    if USAGE_STATE_FILE.exists():
-        try: return json.loads(USAGE_STATE_FILE.read_text())
-        except Exception: pass
-    return {"window_start": None,"prompt_tokens": 0,"completion_tokens": 0,"total_tokens": 0,
-            "input_cost": 0.0,"output_cost": 0.0,"total_cost": 0.0}
+    return dict(_usage_state_mem)
+
 def _save_usage_state(state: dict):
-    try: USAGE_STATE_FILE.write_text(json.dumps(state, indent=2))
-    except Exception as e: log.warning(f"Failed to persist usage state: {e}")
+    global _usage_state_mem
+    _usage_state_mem = dict(state)
+    _fire_db(db.save_usage_state(state))
+
 def _reset_if_needed(state: dict) -> dict:
     now = _now_cst(); ws = _window_start(now); prev = state.get("window_start")
     if not prev or datetime.fromisoformat(prev) != ws:
-        try:
-            if prev:
+        if prev:
+            try:
                 date_for_log = _window_label(datetime.fromisoformat(prev))
-                used = state.get("total_tokens", 0)
-                with USAGE_LOG_FILE.open("a", encoding="utf-8") as f:
-                    f.write(f"{date_for_log} {used}/?\n")
-        except Exception:
-            pass
+                used = int(state.get("total_tokens", 0))
+                _fire_db(db.append_usage_log(date_for_log, used))
+            except Exception:
+                pass
         state = {"window_start": ws.isoformat(),"prompt_tokens": 0,"completion_tokens": 0,"total_tokens": 0,
                  "input_cost": 0.0,"output_cost": 0.0,"total_cost": 0.0}
         _save_usage_state(state)
@@ -740,132 +704,121 @@ def make_embed_card(author: discord.abc.User, translated_text: str, footer_autod
         emb.set_footer(text=f"Auto-delete in {footer_autodelete_seconds}s")
     return emb
 
-# ========== Translation CSV ==========
-TRANSLATION_HEADERS = [
-    "msg_id","channel_id","guild_id","src_msg_id","origin_channel_id",
-    "author_id","author_name","target_lang","is_embed","seq","text","created_at"
-]
-
-def ensure_translation_csv():
-    if not TRANSLATION_CSV.exists():
-        with TRANSLATION_CSV.open("w", newline="", encoding=CSV_ENCODING) as f:
-            w = csv.DictWriter(f, fieldnames=TRANSLATION_HEADERS); w.writeheader()
-
+# ========== Translation log (Postgres) ==========
+# The bot writes every translation it sends to translation_msg in Postgres.
+# Editing a row's `text` (via psql, Dataclips, etc.) makes the watcher edit
+# the corresponding Discord message — replacing the old CSV-edit workflow.
 def append_translation_row(msg: discord.Message, src_msg_id: int, origin_channel_id: Optional[int],
                            author: discord.abc.User, target_lang: Optional[str],
                            is_embed: bool, seq: int, text: str):
-    ensure_translation_csv()
-
     created_dt = getattr(msg, "created_at", None)
     try:
-        created_iso = (created_dt.astimezone(CST) if isinstance(created_dt, datetime)
-                       else datetime.now(tz=CST)).isoformat()
+        created_at = (created_dt.astimezone(CST) if isinstance(created_dt, datetime)
+                      else datetime.now(tz=CST))
     except Exception:
-        created_iso = datetime.now(tz=CST).isoformat()
+        created_at = datetime.now(tz=CST)
 
-    try:
-        with TRANSLATION_CSV.open("a", newline="", encoding=CSV_ENCODING) as f:
-            w = csv.DictWriter(f, fieldnames=TRANSLATION_HEADERS)
-            w.writerow({
-                "msg_id": msg.id, "channel_id": msg.channel.id if msg.channel else "",
-                "guild_id": msg.guild.id if msg.guild else "", "src_msg_id": src_msg_id,
-                "origin_channel_id": origin_channel_id or "", "author_id": getattr(author, "id", ""),
-                "author_name": getattr(author, "display_name", getattr(author, "name", "")),
-                "target_lang": _norm_lang(target_lang) if target_lang else "",
-                "is_embed": 1 if is_embed else 0, "seq": seq, "text": text,
-                "created_at": created_iso
-            })
-    except Exception as e:
-        log.warning(f"append_translation_row failed: {e}")
+    _fire_db(db.insert_translation_row(
+        msg_id=msg.id,
+        channel_id=msg.channel.id if msg.channel else None,
+        guild_id=msg.guild.id if msg.guild else None,
+        src_msg_id=src_msg_id,
+        origin_channel_id=origin_channel_id,
+        author_id=getattr(author, "id", None),
+        author_name=getattr(author, "display_name", getattr(author, "name", "")) or "",
+        target_lang=_norm_lang(target_lang) if target_lang else None,
+        is_embed=bool(is_embed),
+        seq=int(seq),
+        text=text or "",
+        created_at=created_at,
+    ))
 
 translation_cache: Dict[int, Dict[str, str]] = {}
-translation_csv_mtime: float = 0.0
+_translation_watcher_since: Optional[datetime] = None
 
-def load_translation_csv_as_dict() -> Dict[int, Dict[str, str]]:
-    ensure_translation_csv(); out: Dict[int, Dict[str, str]] = {}
-    try:
-        with TRANSLATION_CSV.open("r", newline="", encoding=CSV_ENCODING) as f:
-            r = csv.DictReader(f)
-            for row in r:
-                try:
-                    mid = int(row.get("msg_id", "0") or 0)
-                    if mid <= 0: continue
-                    out[mid] = {
-                        "text": row.get("text", "") or "",
-                        "is_embed": row.get("is_embed", "1"),
-                        "channel_id": row.get("channel_id", ""),
-                        "guild_id": row.get("guild_id", ""),
-                    }
-                except Exception:
-                    continue
-    except Exception as e:
-        log.warning(f"load_translation_csv_as_dict failed: {e}")
-    return out
 
-async def watch_translation_csv_and_apply_edits():
-    global translation_csv_mtime, translation_cache
+async def watch_translation_db_and_apply_edits():
+    """Poll translation_msg for rows whose text changed (via SQL edit) and
+    apply the edit to the corresponding Discord message."""
+    global translation_cache, _translation_watcher_since
     await bot.wait_until_ready()
-    ensure_translation_csv()
-    translation_cache = load_translation_csv_as_dict()
-    try: translation_csv_mtime = TRANSLATION_CSV.stat().st_mtime
-    except Exception: translation_csv_mtime = 0.0
+    try:
+        rows = await db.fetch_all_translations()
+    except Exception as e:
+        log.warning(f"initial translation load failed: {e}")
+        rows = []
+    translation_cache = {
+        int(r["msg_id"]): {"text": r.get("text") or "", "is_embed": "1" if r.get("is_embed") else "0"}
+        for r in rows
+    }
+    _translation_watcher_since = datetime.now(tz=timezone.utc)
+
     while not bot.is_closed():
         try:
             await asyncio.sleep(3)
-            st = TRANSLATION_CSV.stat()
-            if st.st_mtime <= translation_csv_mtime: continue
-            translation_csv_mtime = st.st_mtime
-            latest = load_translation_csv_as_dict()
-            for mid, row in latest.items():
+            since = _translation_watcher_since
+            if since is None:
+                continue
+            try:
+                changed = await db.fetch_translations_changed_since(since)
+            except Exception as e:
+                log.warning(f"poll changed translations failed: {e}")
+                continue
+            if not changed:
+                continue
+            for row in changed:
+                upd_at = row.get("updated_at")
+                if isinstance(upd_at, datetime) and (_translation_watcher_since is None or upd_at > _translation_watcher_since):
+                    _translation_watcher_since = upd_at
+                mid = int(row["msg_id"])
+                new_text = row.get("text") or ""
+                is_embed = bool(row.get("is_embed"))
                 prev = translation_cache.get(mid)
-                new_text = row.get("text", "")
-                is_embed = (row.get("is_embed", "1") == "1")
-                if prev is None or prev.get("text", "") != new_text:
-                    try:
-                        channel_id = int(row.get("channel_id") or 0)
-                        if channel_id <= 0: continue
-                        channel = await bot.fetch_channel(channel_id)
-                        if not isinstance(channel, discord.TextChannel): continue
-                        async with CHANNEL_LOCKS[channel.id]:
-                            try: msg = await channel.fetch_message(mid)
-                            except (discord.NotFound, discord.Forbidden): continue
-                            if is_embed:
-                                old = msg.embeds[0] if msg.embeds else None
-                                desc = new_text[:EMBED_DESC_LIMIT]
-                                if old:
-                                    new_emb = discord.Embed(description=desc)
-                                    if old.author and (old.author.name or old.author.icon_url):
-                                        new_emb.set_author(name=old.author.name or "",
-                                                           icon_url=old.author.icon_url or None)
-                                    if old.footer and old.footer.text:
-                                        new_emb.set_footer(text=old.footer.text)
-                                else:
-                                    new_emb = discord.Embed(description=desc)
-                                await msg.edit(embed=new_emb)
-                            else:
-                                await msg.edit(content=new_text[:MSG_LIMIT])
-                            translation_cache[mid] = {"text": new_text, "is_embed": "1" if is_embed else "0"}
-                            await asyncio.sleep(0.2)
-                    except Exception as e:
-                        log.warning(f"apply edit for msg {mid} failed: {e}")
-            translation_cache = latest
-        except Exception as e:
-            log.warning(f"translation csv watcher loop err: {e}")
-
-# ========= backfill into translation_msg.csv =========
-def _csv_existing_msg_ids() -> Set[int]:
-    ids: Set[int] = set()
-    try:
-        with TRANSLATION_CSV.open("r", newline="", encoding=CSV_ENCODING) as f:
-            for row in csv.DictReader(f):
-                try:
-                    mid = int((row.get("msg_id") or "0").strip() or 0)
-                    if mid > 0: ids.add(mid)
-                except Exception:
+                if prev is not None and prev.get("text", "") == new_text:
                     continue
-    except Exception:
-        pass
-    return ids
+                channel_id = int(row.get("channel_id") or 0)
+                if channel_id <= 0:
+                    translation_cache[mid] = {"text": new_text, "is_embed": "1" if is_embed else "0"}
+                    continue
+                try:
+                    channel = await bot.fetch_channel(channel_id)
+                    if not isinstance(channel, discord.TextChannel):
+                        continue
+                    async with CHANNEL_LOCKS[channel.id]:
+                        try:
+                            msg = await channel.fetch_message(mid)
+                        except (discord.NotFound, discord.Forbidden):
+                            translation_cache[mid] = {"text": new_text, "is_embed": "1" if is_embed else "0"}
+                            continue
+                        if is_embed:
+                            old = msg.embeds[0] if msg.embeds else None
+                            desc = new_text[:EMBED_DESC_LIMIT]
+                            if old:
+                                new_emb = discord.Embed(description=desc)
+                                if old.author and (old.author.name or old.author.icon_url):
+                                    new_emb.set_author(name=old.author.name or "",
+                                                       icon_url=old.author.icon_url or None)
+                                if old.footer and old.footer.text:
+                                    new_emb.set_footer(text=old.footer.text)
+                            else:
+                                new_emb = discord.Embed(description=desc)
+                            await msg.edit(embed=new_emb)
+                        else:
+                            await msg.edit(content=new_text[:MSG_LIMIT])
+                        translation_cache[mid] = {"text": new_text, "is_embed": "1" if is_embed else "0"}
+                        await asyncio.sleep(0.2)
+                except Exception as e:
+                    log.warning(f"apply edit for msg {mid} failed: {e}")
+        except Exception as e:
+            log.warning(f"translation db watcher loop err: {e}")
+
+# ========= backfill into translation_msg =========
+async def _existing_translation_ids() -> Set[int]:
+    try:
+        return await db.fetch_existing_translation_ids()
+    except Exception as e:
+        log.warning(f"_existing_translation_ids failed: {e}")
+        return set()
 
 async def _backfill_channel(channel: discord.TextChannel, *, days: Optional[int],
                             max_msgs: Optional[int], default_lang: Optional[str]) -> Tuple[int, int]:
@@ -877,7 +830,7 @@ async def _backfill_channel(channel: discord.TextChannel, *, days: Optional[int]
     history_kwargs = {"limit": (max_msgs if (isinstance(max_msgs, int) and max_msgs > 0) else None)}
     if after_dt: history_kwargs["after"] = after_dt
 
-    existing_ids: Set[int] = _csv_existing_msg_ids()
+    existing_ids: Set[int] = await _existing_translation_ids()
 
     try:
         async for m in channel.history(**history_kwargs):
@@ -923,7 +876,7 @@ async def slash_add(interaction: discord.Interaction, channel: discord.TextChann
             r["language"] = code
             if flag is not None:
                 r["flag"] = bool(flag)
-            save_rules()
+            _persist_rule(channel.id)
             await interaction.response.send_message(
                 f"✅ Set language for linked-only rule: <#{channel.id}> → `{language.value}` (`{code}`), flag={r['flag']}",
                 ephemeral=True
@@ -1064,13 +1017,13 @@ async def slash_help(interaction: discord.Interaction):
         "• `/del channel:<#channel>` — delete a rule\n"
         "• `/add_flag channel:<#channel>` — enable flag-emoji translation only (language unchanged)\n"
         "• `/usage` — show today's OpenAI usage\n"
-        "• `/backfill_csv [channel] [days] [max_per_channel]` — backfill historical bot messages into CSV\n"
+        "• `/backfill_csv [channel] [days] [max_per_channel]` — backfill historical bot messages into the translation log\n"
         "• `/syn_his channel:<#dest> [max_count] [days] [skip_existing]` — sync history from linked channel\n"
-        "• `/correct [size:<50|100|200>]` — scan last N CSV rows; fix texts not in target language\n"
-        f"\n**Live edit:** edit `{TRANSLATION_CSV}` → change `text` → the message will be edited in Discord.\n"
+        "• `/correct [size:<50|100|200>]` — scan last N log rows; fix texts not in target language\n"
+        "\n**Live edit:** update `translation_msg.text` in Postgres → the bot edits the matching Discord message.\n"
         "Notes:\n"
-        "• CSV uses `utf-8-sig` to avoid mojibake in Excel.\n"
-        "• `created_at` in CSV is the REAL message creation time (converted to CST).\n"
+        "• Translation history lives in the `translation_msg` table.\n"
+        "• `created_at` is the REAL message creation time in UTC.\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
@@ -1329,27 +1282,22 @@ async def slash_correct(interaction: discord.Interaction, size: app_commands.Cho
     except Exception:
         pass
 
-    ensure_translation_csv()
-    rows: List[dict] = []
+    window_n = int(size.value) if size is not None else 50
     try:
-        with TRANSLATION_CSV.open("r", newline="", encoding=CSV_ENCODING) as f:
-            r = csv.DictReader(f)
-            rows = list(r)
+        rows = await db.fetch_recent_translations(window_n)
     except Exception as e:
-        await safe_reply(interaction, f"❌ Failed to read CSV: {e}")
+        await safe_reply(interaction, f"❌ Failed to read DB: {e}")
         return
 
     if not rows:
-        await safe_reply(interaction, "ℹ️ CSV is empty.")
+        await safe_reply(interaction, "ℹ️ No translations recorded yet.")
         return
 
-    window_n = int(size.value) if size is not None else 50
-    window = rows[-window_n:]
     updated = 0
-    checked = len(window)
+    checked = len(rows)
     errors: List[str] = []
 
-    for idx, row in enumerate(window):
+    for row in rows:
         try:
             text = (row.get("text") or "").strip()
             tgt  = _norm_lang(row.get("target_lang") or "")
@@ -1367,28 +1315,18 @@ async def slash_correct(interaction: discord.Interaction, size: app_commands.Cho
                     continue
                 new_text = await translate_to(text, tgt)
 
-            if not new_text:
+            if not new_text or new_text.strip() == text:
                 continue
 
-            rows[-checked + idx]["text"] = new_text
-            updated += 1
+            try:
+                await db.update_translation_text(int(row["msg_id"]), new_text)
+                updated += 1
+            except Exception as e:
+                errors.append(str(e))
         except Exception as e:
             errors.append(str(e))
             continue
         await asyncio.sleep(0)
-
-    if updated > 0:
-        try:
-            with TRANSLATION_CSV.open("w", newline="", encoding=CSV_ENCODING) as f:
-                w = csv.DictWriter(f, fieldnames=TRANSLATION_HEADERS)
-                w.writeheader()
-                for r in rows:
-                    rec = {k: r.get(k, "") for k in TRANSLATION_HEADERS}
-                    w.writerow(rec)
-            TRANSLATION_CSV.touch()
-        except Exception as e:
-            await safe_reply(interaction, f"❌ Failed to write CSV: {e}")
-            return
 
     msg = f"✅ /correct done. Checked: {checked}, Fixed: {updated}"
     if errors:
@@ -1649,10 +1587,13 @@ async def slash_sync(interaction: discord.Interaction):
 # ========== Ready ==========
 @bot.event
 async def on_ready():
-    load_rules(); load_usage(); load_relay_map(); load_relay_origin(); load_reverse_relay()
-    ensure_translation_csv()
-    asyncio.create_task(watch_translation_csv_and_apply_edits())
-    asyncio.create_task(_state_flusher())
+    await load_rules()
+    await load_usage()
+    await load_relay_map()
+    await load_relay_origin()
+    await load_reverse_relay()
+    await load_usage_state_from_db()
+    asyncio.create_task(watch_translation_db_and_apply_edits())
     _reset_if_needed(_load_usage_state())
 
     try:
@@ -1674,20 +1615,28 @@ async def on_ready():
     log.info(f"=== PieTrans BOT_VERSION = {BOT_VERSION} ===")
     log.info(f"=== Running file: {_running_file} ===")
     log.info(f"Logged in as {bot.user} (id={bot.user.id})")
-    log.info(f"Translation CSV: {TRANSLATION_CSV.resolve()}")
+    log.info("Translation log: Postgres table `translation_msg`")
     log.info(f"OpenAI model: {OPENAI_MODEL}")
     if DEBUG_MODE: log.debug("DEBUG MODE is ON")
     activity = discord.Game(DESC.get("activity") or DESC.get("short_name") or "Translator")
     await bot.change_presence(status=discord.Status.online, activity=activity)
 
 # ========== Main ==========
-def main():
+async def _async_main():
+    await db.init_pool(DATABASE_URL)
     try:
-        bot.run(DISCORD_TOKEN)
+        async with bot:
+            await bot.start(DISCORD_TOKEN)
     finally:
-        if _dirty_paths:
-            log.info(f"Flushing {len(_dirty_paths)} dirty state file(s) on shutdown.")
-            _flush_dirty()
+        try:
+            await db.close_pool()
+        except Exception as e:
+            log.warning(f"close_pool failed: {e}")
+
+
+def main():
+    asyncio.run(_async_main())
+
 
 if __name__ == "__main__":
     main()
