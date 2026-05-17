@@ -1,9 +1,9 @@
 {
   "window_start": "2026-05-16T19:00:00-05:00",
-  "prompt_tokens": 22590,
-  "completion_tokens": 3527,
-  "total_tokens": 26117,
-  "input_cost": 0.028239,
-  "output_cost": 0.03527,
-  "total_cost": 0.063509
+  "prompt_tokens": 22775,
+  "completion_tokens": 3532,
+  "total_tokens": 26307,
+  "input_cost": 0.02847,
+  "output_cost": 0.03532,
+  "total_cost": 0.06379
 }
