@@ -298,5 +298,15 @@
     "language": "en",
     "flag": true,
     "link_channel_id": 1375358007268868097
+  },
+  "1500519197208350800": {
+    "language": "ja",
+    "flag": true,
+    "link_channel_id": 1500943928789041335
+  },
+  "1500943928789041335": {
+    "language": "en",
+    "flag": true,
+    "link_channel_id": 1500519197208350800
   }
 }
