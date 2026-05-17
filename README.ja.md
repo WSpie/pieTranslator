@@ -38,7 +38,7 @@ OPENAI_API_KEY: sk-...
 機密でない実行時設定は `.env` に：
 
 ```
-OPENAI_MODEL=gpt-4o-mini
+OPENAI_MODEL=gpt-5.4-mini
 PIES_DEBUG=0
 FLAG_EPHEMERAL_SECONDS=60
 ```

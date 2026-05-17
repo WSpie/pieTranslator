@@ -38,7 +38,7 @@ OPENAI_API_KEY: sk-...
 Non-secret runtime knobs go in `.env`:
 
 ```
-OPENAI_MODEL=gpt-4o-mini
+OPENAI_MODEL=gpt-5.4-mini
 PIES_DEBUG=0
 FLAG_EPHEMERAL_SECONDS=60
 ```
