@@ -23,7 +23,7 @@ There is a daily OpenAI budget cap (default $5, configurable). The window resets
 Install dependencies:
 
 ```
-pip install "discord.py>=2.0" openai python-dotenv pyyaml certifi
+pip install -r requirements.txt
 ```
 
 Tested on Python 3.10 with discord.py 2.6.

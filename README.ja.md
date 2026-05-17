@@ -23,7 +23,7 @@ OpenAI には日次の予算上限がある（デフォルト $5、変更可）�
 依存パッケージのインストール：
 
 ```
-pip install "discord.py>=2.0" openai python-dotenv pyyaml certifi
+pip install -r requirements.txt
 ```
 
 Python 3.10 + discord.py 2.6 で動作確認済み。
