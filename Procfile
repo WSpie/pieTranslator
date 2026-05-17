@@ -1,0 +1,1 @@
+worker: python pies_translator_OPENAI.py

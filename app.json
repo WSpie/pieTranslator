@@ -1,0 +1,52 @@
+{
+  "name": "Pie's Translator",
+  "description": "Discord bot for cross-language chat translation.",
+  "repository": "https://github.com/WSpie/pieTranslator",
+  "keywords": ["discord", "bot", "openai", "translator"],
+  "stack": "heroku-22",
+  "addons": [
+    {
+      "plan": "heroku-postgresql:essential-0"
+    }
+  ],
+  "env": {
+    "DISCORD_TOKEN": {
+      "description": "Discord bot token.",
+      "required": true
+    },
+    "OPENAI_API_KEY": {
+      "description": "OpenAI API key.",
+      "required": true
+    },
+    "OPENAI_MODEL": {
+      "description": "OpenAI model name used for translation.",
+      "value": "gpt-4o-mini"
+    },
+    "PIES_DEBUG": {
+      "description": "Set to 1 for verbose logging.",
+      "value": "0"
+    },
+    "FLAG_EPHEMERAL_SECONDS": {
+      "description": "Auto-delete seconds for flag-emoji translations.",
+      "value": "60"
+    },
+    "OPENAI_BUDGET_DOLLARS_PER_DAY": {
+      "description": "Daily OpenAI spend cap in dollars. Set to 0 to disable.",
+      "value": "5.00"
+    },
+    "OPENAI_COST_PER_1M_INPUT": {
+      "description": "Estimated USD per 1M prompt tokens for budget tracking.",
+      "value": "1.25"
+    },
+    "OPENAI_COST_PER_1M_OUTPUT": {
+      "description": "Estimated USD per 1M completion tokens for budget tracking.",
+      "value": "10.00"
+    }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  }
+}
