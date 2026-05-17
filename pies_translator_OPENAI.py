@@ -481,7 +481,9 @@ async def openai_chat(messages: List[dict],
         "temperature": float(temperature),
     }
     if max_tokens is not None:
-        payload["max_tokens"] = int(max_tokens)
+        # Newer OpenAI models (gpt-4o family onward) require
+        # max_completion_tokens; legacy max_tokens returns 400 on them.
+        payload["max_completion_tokens"] = int(max_tokens)
 
     try:
         r = await asyncio.wait_for(client_ai.chat.completions.create(**payload), timeout=timeout_sec)
