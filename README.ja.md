@@ -1,6 +1,6 @@
 # Pie's Translator
 
-[English](README.md)
+[English](README.md) · [中文](README.zh.md)
 
 言語を跨ぐ Discord チャット翻訳 bot。今は *Last War: Survival Game* 用に設定してある。`profile/` の 2 ファイルを差し替えれば他のゲームにも転用できる。コード本体は汎用エンジン。
 

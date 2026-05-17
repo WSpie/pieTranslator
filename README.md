@@ -1,6 +1,6 @@
 # Pie's Translator
 
-[日本語](README.ja.md)
+[日本語](README.ja.md) · [中文](README.zh.md)
 
 A Discord bot for cross-language chat. Set up right now for *Last War: Survival Game*. Swap two files in `profile/` to point it at a different game. Everything else stays the same.
 
