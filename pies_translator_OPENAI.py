@@ -48,18 +48,40 @@ def _secret(key: str) -> str:
     return (os.getenv(key) or str(_cfg.get(key, "") or "")).strip()
 
 
+# Provider switch: "1" = OpenAI (default), "2" = TAMU AI Chat.
+API_OPTION = (os.getenv("API_OPTION") or str(_cfg.get("API_OPTION", "") or "") or "1").strip()
+
 DISCORD_TOKEN  = _secret("DISCORD_TOKEN")
 OPENAI_API_KEY = _secret("OPENAI_API_KEY")
+TAMU_API_KEY   = _secret("TAMU_API_KEY")
 DATABASE_URL   = _secret("DATABASE_URL")
 
 DEBUG_MODE             = os.getenv("PIES_DEBUG", "0").strip() == "1"
 FLAG_EPHEMERAL_SECONDS = int(os.getenv("FLAG_EPHEMERAL_SECONDS", "60"))
 OPENAI_MODEL           = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
+# TAMU AI Chat is OpenAI-compatible (powered by Open WebUI).
+# - Endpoint is institution-specific; Texas A&M University = https://chat-api.tamu.ai
+#   (see https://docs.tamus.ai/docs/prod/api-tool/api-endpoints/ for other campuses).
+# - The OpenAI SDK appends /chat/completions and /models to base_url, so it ends in /api.
+# - TAMU model ids are namespaced with a "protected." prefix, e.g. protected.gpt-4.1-mini.
+#   List them: curl -H "Authorization: Bearer $TAMU_API_KEY" https://chat-api.tamu.ai/api/models
+TAMU_API_ENDPOINT = os.getenv("TAMU_API_ENDPOINT", "https://chat-api.tamu.ai").strip().rstrip("/")
+TAMU_BASE_URL     = TAMU_API_ENDPOINT + "/api"
+TAMU_MODEL        = os.getenv("TAMU_MODEL", "protected.gemini-2.5-flash-lite").strip()
+
+USE_TAMU     = API_OPTION == "2"
+ACTIVE_MODEL = TAMU_MODEL if USE_TAMU else OPENAI_MODEL
+PROVIDER     = "TAMU" if USE_TAMU else "OpenAI"
+
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_TOKEN: set env var or add it to config.yaml")
-if not OPENAI_API_KEY:
-    raise SystemExit("Missing OPENAI_API_KEY: set env var or add it to config.yaml")
+if USE_TAMU:
+    if not TAMU_API_KEY:
+        raise SystemExit("API_OPTION=2 but TAMU_API_KEY is missing: set env var or add it to config.yaml")
+else:
+    if not OPENAI_API_KEY:
+        raise SystemExit("API_OPTION=1 but OPENAI_API_KEY is missing: set env var or add it to config.yaml")
 if not DATABASE_URL:
     raise SystemExit(
         "Missing DATABASE_URL: set env var (Heroku Postgres injects it) "
@@ -75,11 +97,17 @@ log = logging.getLogger("PieTrans")
 if DEBUG_MODE:
     log.setLevel(logging.DEBUG)
 
-# ========== OpenAI client ==========
+# ========== LLM client (OpenAI-compatible) ==========
 # 说明：
 # - timeout/max_retries 在这里做默认兜底
 # - 单次请求仍可用 asyncio.wait_for 进一步收紧
-client_ai = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=60.0, max_retries=2)
+# - API_OPTION=2 时指向 TAMU AI Chat（OpenAI 兼容），否则用官方 OpenAI。
+if USE_TAMU:
+    client_ai = AsyncOpenAI(api_key=TAMU_API_KEY, base_url=TAMU_BASE_URL, timeout=60.0, max_retries=2)
+    log.info(f"LLM provider: TAMU AI Chat | base_url={TAMU_BASE_URL} | model={ACTIVE_MODEL}")
+else:
+    client_ai = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=60.0, max_retries=2)
+    log.info(f"LLM provider: OpenAI | model={ACTIVE_MODEL}")
 
 # ========== Storage ==========
 # All runtime state lives in Postgres (via db.py) so the bot can run on
@@ -440,14 +468,18 @@ async def openai_chat(messages: List[dict],
         raise RuntimeError("Daily budget exceeded")
 
     payload = {
-        "model": model or OPENAI_MODEL,
+        "model": model or ACTIVE_MODEL,
         "messages": messages,
         "temperature": float(temperature),
     }
     if max_tokens is not None:
-        # Newer OpenAI models (gpt-4o family onward) require
-        # max_completion_tokens; legacy max_tokens returns 400 on them.
-        payload["max_completion_tokens"] = int(max_tokens)
+        if USE_TAMU:
+            # TAMU (Open WebUI) expects the standard OpenAI max_tokens field.
+            payload["max_tokens"] = int(max_tokens)
+        else:
+            # Newer OpenAI models (gpt-4o family onward) require
+            # max_completion_tokens; legacy max_tokens returns 400 on them.
+            payload["max_completion_tokens"] = int(max_tokens)
 
     try:
         r = await asyncio.wait_for(client_ai.chat.completions.create(**payload), timeout=timeout_sec)
@@ -613,7 +645,7 @@ async def detect_lang(text: str) -> str:
         ]
         reply, _, _ = await openai_chat(
             messages=messages,
-            model=OPENAI_MODEL,
+            model=ACTIVE_MODEL,
             temperature=0.0,
             max_tokens=6,
             timeout_sec=15.0
@@ -995,9 +1027,9 @@ async def slash_usage(interaction: discord.Interaction):
     prompt_toks = state.get("prompt_tokens", 0)
     comp_toks   = state.get("completion_tokens", 0)
     msg = (
-        f"**OpenAI Usage (window resets 19:00 CST)**\n"
+        f"**{PROVIDER} Usage (window resets 19:00 CST)**\n"
         f"- Date: `{_window_label(_now_cst())}`\n"
-        f"- Model: `{OPENAI_MODEL}`\n"
+        f"- Model: `{ACTIVE_MODEL}`\n"
         f"- Tokens: `{used_tokens}` (prompt `{prompt_toks}`, completion `{comp_toks}`)\n"
         f"- Est. Cost: `${state.get('total_cost', 0.0):.4f}` "
         f"(input `${state.get('input_cost', 0.0):.4f}`, output `${state.get('output_cost', 0.0):.4f}`)\n"
@@ -1616,7 +1648,7 @@ async def on_ready():
     log.info(f"=== Running file: {_running_file} ===")
     log.info(f"Logged in as {bot.user} (id={bot.user.id})")
     log.info("Translation log: Postgres table `translation_msg`")
-    log.info(f"OpenAI model: {OPENAI_MODEL}")
+    log.info(f"Translation provider: {PROVIDER} | model: {ACTIVE_MODEL}")
     if DEBUG_MODE: log.debug("DEBUG MODE is ON")
     activity = discord.Game(DESC.get("activity") or DESC.get("short_name") or "Translator")
     await bot.change_presence(status=discord.Status.online, activity=activity)

@@ -28,20 +28,48 @@ pip install -r requirements.txt
 
 Tested on Python 3.10 with discord.py 2.6.
 
-Put secrets in `config.yaml` (gitignored):
+Secrets come from environment variables (Heroku Config Vars). For local dev you
+can instead put them in `config.yaml` (gitignored); env vars take precedence:
 
 ```yaml
 DISCORD_TOKEN: your-discord-bot-token
-OPENAI_API_KEY: sk-...
+OPENAI_API_KEY: sk-...        # needed when API_OPTION=1
+TAMU_API_KEY: sk-...          # needed when API_OPTION=2
+DATABASE_URL: postgres://...  # Heroku Postgres injects this automatically
 ```
 
 Non-secret runtime knobs go in `.env`:
 
 ```
+API_OPTION=1                  # 1 = OpenAI (default), 2 = TAMU AI Chat
 OPENAI_MODEL=gpt-5.4-mini
 PIES_DEBUG=0
 FLAG_EPHEMERAL_SECONDS=60
 ```
+
+### Using TAMU AI Chat instead of OpenAI
+
+TAMU AI Chat is OpenAI-compatible, so the translator can talk to it directly.
+Set `API_OPTION=2` and provide a `TAMU_API_KEY` (create one at https://tamus.ai →
+Settings → Account → API Key). Optional knobs:
+
+```
+API_OPTION=2
+TAMU_MODEL=protected.gemini-2.5-flash-lite   # note the required "protected." prefix
+TAMU_API_ENDPOINT=https://chat-api.tamu.ai   # your campus endpoint; default is Texas A&M University
+```
+
+TAMU model ids are namespaced with `protected.` (e.g. `protected.gpt-4.1-mini`,
+`protected.gpt-5.4-mini`). List the exact ids available to you with:
+
+```bash
+curl -H "Authorization: Bearer $TAMU_API_KEY" https://chat-api.tamu.ai/api/models
+```
+
+On Heroku (this branch's deploy target), add `API_OPTION=2` and `TAMU_API_KEY`
+as Config Vars — the dyno restarts and switches over. Find your campus endpoint
+(if you're not at Texas A&M University) at
+https://docs.tamus.ai/docs/prod/api-tool/api-endpoints/.
 
 The two files in `profile/` describe the game. If `desc.json` is missing the bot still runs, just as a generic translator with no game context.
 

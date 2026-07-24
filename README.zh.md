@@ -28,20 +28,47 @@ pip install -r requirements.txt
 
 在 Python 3.10 + discord.py 2.6 上验证过。
 
-密钥放在 `config.yaml` 里（已 gitignore）：
+密钥从环境变量读取（Heroku Config Vars）。本地开发也可以放进 `config.yaml`
+（已 gitignore）；两者都设时环境变量优先：
 
 ```yaml
 DISCORD_TOKEN: your-discord-bot-token
-OPENAI_API_KEY: sk-...
+OPENAI_API_KEY: sk-...        # API_OPTION=1 时需要
+TAMU_API_KEY: sk-...          # API_OPTION=2 时需要
+DATABASE_URL: postgres://...  # Heroku Postgres 会自动注入
 ```
 
 非敏感的运行参数放 `.env`：
 
 ```
+API_OPTION=1                  # 1 = OpenAI（默认），2 = TAMU AI Chat
 OPENAI_MODEL=gpt-5.4-mini
 PIES_DEBUG=0
 FLAG_EPHEMERAL_SECONDS=60
 ```
+
+### 用 TAMU AI Chat 代替 OpenAI
+
+TAMU AI Chat 兼容 OpenAI 接口，翻译逻辑完全不用改。把 `API_OPTION` 设成 `2`，
+并提供 `TAMU_API_KEY`（在 https://tamus.ai 登录 → Settings → Account → API Key
+创建）。可选项：
+
+```
+API_OPTION=2
+TAMU_MODEL=protected.gemini-2.5-flash-lite   # 注意必须带 "protected." 前缀
+TAMU_API_ENDPOINT=https://chat-api.tamu.ai   # 你所在院校的端点，默认是 Texas A&M University
+```
+
+TAMU 的模型名都带 `protected.` 前缀（如 `protected.gpt-4.1-mini`、
+`protected.gpt-5.4-mini`）。列出你可用的确切模型 id：
+
+```bash
+curl -H "Authorization: Bearer $TAMU_API_KEY" https://chat-api.tamu.ai/api/models
+```
+
+**在 Heroku 上（此分支的部署目标）**：在 Config Vars 里加 `API_OPTION=2` 和
+`TAMU_API_KEY`，保存后 dyno 会自动重启切到 TAMU。不在 Texas A&M University 的话，
+去 https://docs.tamus.ai/docs/prod/api-tool/api-endpoints/ 查你院校的端点。
 
 `profile/` 下两个文件描述游戏。`desc.json` 缺失的话 bot 照样能跑，只是变成无游戏上下文的通用翻译。
 
