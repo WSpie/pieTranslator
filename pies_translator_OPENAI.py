@@ -458,6 +458,42 @@ def _budget_ok(state: dict) -> bool:
     return state.get("total_cost", 0.0) < BUDGET_DOLLARS_PER_DAY
 
 # ========== OpenAI chat wrapper ==========
+def _parse_completion(r) -> Tuple[str, int, int]:
+    """Extract (content, prompt_tokens, completion_tokens) from a chat completion.
+
+    Handles the three shapes we can get back:
+      - a parsed ChatCompletion object (official OpenAI),
+      - a dict (some OpenAI-compatible gateways),
+      - a raw JSON str (TAMU/Open WebUI sometimes returns the body unparsed).
+    """
+    if isinstance(r, str):
+        try:
+            r = json.loads(r)
+        except Exception:
+            raise RuntimeError(f"Unexpected non-JSON response: {r[:200]!r}")
+
+    if isinstance(r, dict):
+        choices = r.get("choices") or []
+        msg = (choices[0].get("message") or {}) if choices else {}
+        reply = (msg.get("content") or "").strip()
+        usage_obj = r.get("usage") or {}
+        prompt_tokens = int(usage_obj.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(usage_obj.get("completion_tokens", 0) or 0)
+        return reply, prompt_tokens, completion_tokens
+
+    # Parsed SDK object.
+    reply = (r.choices[0].message.content or "").strip()
+    prompt_tokens = 0
+    completion_tokens = 0
+    try:
+        if r.usage:
+            prompt_tokens = int(getattr(r.usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(r.usage, "completion_tokens", 0) or 0)
+    except Exception:
+        pass
+    return reply, prompt_tokens, completion_tokens
+
+
 async def openai_chat(messages: List[dict],
                       model: Optional[str] = None,
                       temperature: float = 0.0,
@@ -471,6 +507,9 @@ async def openai_chat(messages: List[dict],
         "model": model or ACTIVE_MODEL,
         "messages": messages,
         "temperature": float(temperature),
+        # Explicit non-stream. TAMU/Open WebUI may otherwise stream and the SDK
+        # then hands back the raw body as a str instead of a parsed object.
+        "stream": False,
     }
     if max_tokens is not None:
         if USE_TAMU:
@@ -483,16 +522,7 @@ async def openai_chat(messages: List[dict],
 
     try:
         r = await asyncio.wait_for(client_ai.chat.completions.create(**payload), timeout=timeout_sec)
-        reply = (r.choices[0].message.content or "").strip()
-
-        prompt_tokens = 0
-        completion_tokens = 0
-        try:
-            if r.usage:
-                prompt_tokens = int(getattr(r.usage, "prompt_tokens", 0) or 0)
-                completion_tokens = int(getattr(r.usage, "completion_tokens", 0) or 0)
-        except Exception:
-            pass
+        reply, prompt_tokens, completion_tokens = _parse_completion(r)
 
         st = _append_usage(_load_usage_state(), prompt_tokens, completion_tokens)
         if not _budget_ok(st):
