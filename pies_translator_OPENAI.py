@@ -68,7 +68,7 @@ OPENAI_MODEL           = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 #   List them: curl -H "Authorization: Bearer $TAMU_API_KEY" https://chat-api.tamu.ai/api/models
 TAMU_API_ENDPOINT = os.getenv("TAMU_API_ENDPOINT", "https://chat-api.tamu.ai").strip().rstrip("/")
 TAMU_BASE_URL     = TAMU_API_ENDPOINT + "/api"
-TAMU_MODEL        = os.getenv("TAMU_MODEL", "protected.gemini-2.5-flash-lite").strip()
+TAMU_MODEL        = os.getenv("TAMU_MODEL", "protected.gpt-5.4-mini").strip()
 
 USE_TAMU     = API_OPTION == "2"
 ACTIVE_MODEL = TAMU_MODEL if USE_TAMU else OPENAI_MODEL

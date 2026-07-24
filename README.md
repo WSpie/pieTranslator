@@ -55,7 +55,7 @@ Settings → Account → API Key). Optional knobs:
 
 ```
 API_OPTION=2
-TAMU_MODEL=protected.gemini-2.5-flash-lite   # note the required "protected." prefix
+TAMU_MODEL=protected.gpt-5.4-mini            # note the required "protected." prefix
 TAMU_API_ENDPOINT=https://chat-api.tamu.ai   # your campus endpoint; default is Texas A&M University
 ```
 

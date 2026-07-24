@@ -55,7 +55,7 @@ TAMU AI Chat 兼容 OpenAI 接口，翻译逻辑完全不用改。把 `API_OPTIO
 
 ```
 API_OPTION=2
-TAMU_MODEL=protected.gemini-2.5-flash-lite   # 注意必须带 "protected." 前缀
+TAMU_MODEL=protected.gpt-5.4-mini            # 注意必须带 "protected." 前缀
 TAMU_API_ENDPOINT=https://chat-api.tamu.ai   # 你所在院校的端点，默认是 Texas A&M University
 ```
 
